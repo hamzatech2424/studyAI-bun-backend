@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1757959393092,
+      "tag": "0000_wide_night_nurse",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1757959687799,
+      "tag": "0001_powerful_rhodey",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1757971645425,
+      "tag": "0002_romantic_mattie_franklin",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1758047338713,
+      "tag": "0003_smooth_synch",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1758049828648,
+      "tag": "0004_romantic_stryfe",
+      "breakpoints": true
+    }
+  ]
+}

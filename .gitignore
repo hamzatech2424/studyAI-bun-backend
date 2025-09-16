@@ -1,0 +1,56 @@
+# ------------------------
+# Node / Bun dependencies
+# ------------------------
+node_modules/
+bun.lockb
+.pnp.*
+.pnp.js
+
+# Yarn (Classic & Berry)
+.yarn/*
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+.yarnrc.yml
+yarn.lock
+yarn-error.log
+
+# ------------------------
+# Logs
+# ------------------------
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+lerna-debug.log*
+
+# ------------------------
+# Build / Output
+# ------------------------
+dist/
+build/
+out/
+.tmp/
+.cache/
+coverage/
+
+# ------------------------
+# OS junk files
+# ------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------
+# Environment files
+# ------------------------
+.env
+.env.local
+.env.*.local
+
+# ------------------------
+# IDE / Editor
+# ------------------------
+.vscode/
+.idea/
+*.swp

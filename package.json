@@ -1,0 +1,39 @@
+{
+  "name": "backend",
+  "module": "server.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "clean": "rm -rf dist && echo 'Done.'",
+    "dev": "bun --hot server.ts",
+    "start": "bun server.ts",
+    "db:generate": "bun drizzle-kit generate",
+    "db:migrate": "bun drizzle-kit migrate",
+    "db:push": "bun drizzle-kit push --verbose",
+    "db:push:force": "bun drizzle-kit push --force",
+    "db:studio": "bun drizzle-kit studio",
+    "db:reset": "bun drizzle-kit drop && bun drizzle-kit push"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/pdf-parse": "^1.1.5",
+    "drizzle-kit": "^0.31.4",
+    "tsx": "^4.20.5"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@clerk/backend": "^2.14.0",
+    "@hono/clerk-auth": "^3.0.3",
+    "dotenv": "^17.2.2",
+    "drizzle-orm": "^0.44.5",
+    "hono": "^4.9.7",
+    "openai": "^5.20.3",
+    "pdf-parse": "^1.1.1",
+    "pdf2pic": "^3.2.0",
+    "pdfjs-dist": "^5.4.149",
+    "pgvector": "^0.2.1",
+    "postgres": "^3.4.7"
+  }
+}
