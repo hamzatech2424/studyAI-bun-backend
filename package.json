@@ -26,6 +26,7 @@
   "dependencies": {
     "@clerk/backend": "^2.14.0",
     "@hono/clerk-auth": "^3.0.3",
+    "@supabase/supabase-js": "^2.57.4",
     "dotenv": "^17.2.2",
     "drizzle-orm": "^0.44.5",
     "hono": "^4.9.7",

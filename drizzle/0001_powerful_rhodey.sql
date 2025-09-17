@@ -1,2 +1,0 @@
-CREATE UNIQUE INDEX "sessions_clerk_session_id_unique" ON "sessions" USING btree ("clerk_session_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "users_clerk_id_unique" ON "users" USING btree ("clerk_id");

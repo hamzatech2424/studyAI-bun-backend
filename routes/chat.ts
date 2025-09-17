@@ -1,16 +1,18 @@
 import { successResponseHelper, errorResponseHelper } from '../utils/response';
-import { documentsTable, docChunksTable } from '../modals/schema';
+import { documentsTable, docChunksTable, chatsTable, chatMessagesTable } from '../modals/schema';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import { eq } from 'drizzle-orm';
+import { eq, asc } from 'drizzle-orm';
 import postgres from 'postgres';
 // Import pdf-parse dynamically to avoid debug mode issues
 const pdfParse = require("pdf-parse");
 import { chunkText, cleanText } from '../helper/documnetHelper';
 import OpenAI from "openai";
+import { fileUpload } from '../helper/supabase';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
 });
+
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -33,6 +35,18 @@ const uploadDocument = async (c: any) => {
         // read file buffer
         const buf = Buffer.from(await file.arrayBuffer());
 
+        let fileUrl: string;
+        try {
+            fileUrl = await fileUpload(file, buf);
+        } catch (uploadError) {
+            console.error("File upload error:", uploadError);
+            return c.json({
+                success: false,
+                error: "File upload failed",
+                message: uploadError instanceof Error ? uploadError.message : "Unknown upload error"
+            }, 500);
+        }
+
         // parse PDF
         const parsed = await pdfParse(buf);
         const text = cleanText(parsed.text || "");
@@ -47,6 +61,7 @@ const uploadDocument = async (c: any) => {
             .values({
                 userId: userId ?? null,
                 filePath: file.name,
+                fileUrl: fileUrl as string,
                 fileName: file.name,
             })
             .returning();
@@ -80,7 +95,80 @@ const uploadDocument = async (c: any) => {
             }
         }
 
-        return c.json({ documentId: doc?.id, doc, message: "Upload successful" });
+        // Generate a descriptive title from the first chunk of text
+        let chatTitle = file.name;
+        try {
+            const titleResponse = await openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [
+                    {
+                        role: "system",
+                        content: "Generate a short, descriptive title (max 5 words) for this document based on its content."
+                    },
+                    {
+                        role: "user",
+                        content: chunks[0] || file.name
+                    }
+                ],
+                temperature: 0.3,
+                max_tokens: 20
+            });
+            chatTitle = titleResponse.choices[0]?.message?.content || file.name;
+        } catch (err) {
+            console.error("Error generating chat title:", err);
+            // Fallback to filename if title generation fails
+        }
+
+        const [chat] = await db.insert(chatsTable)
+            .values({
+                userId: userId ?? null,
+                documentId: doc?.id,
+                title: chatTitle,
+            })
+            .returning({ id: chatsTable.id, userId: chatsTable.userId, documentId: chatsTable.documentId, title: chatsTable.title });
+
+        // 2️⃣ Insert initial AI message
+        const [chatMessage] = await db.insert(chatMessagesTable)
+            .values({
+                chatId: chat?.id,
+                type: "ai",
+                content: "How can I assist you?",
+            })
+            .returning({
+                content: chatMessagesTable.content,
+                type: chatMessagesTable.type,
+                createdAt: chatMessagesTable.createdAt,
+            });
+
+        // 3️⃣ Update chat lastMessage
+        await db.update(chatsTable)
+            .set({
+                lastMessage: chatMessage?.content,
+                lastMessageType: chatMessage?.type,
+                lastMessageAt: chatMessage?.createdAt || new Date(),
+            })
+            .where(eq(chatsTable.id, chat?.id));
+
+        // Get all messages for this chat
+        const messages = await db.select({
+            id: chatMessagesTable.id,
+            content: chatMessagesTable.content,
+            type: chatMessagesTable.type,
+            createdAt: chatMessagesTable.createdAt,
+            metadata: chatMessagesTable.metadata
+        })
+            .from(chatMessagesTable)
+            .where(eq(chatMessagesTable.chatId, chat?.id))
+            .orderBy(asc(chatMessagesTable.createdAt));
+
+        return c.json({
+            chat: {
+                ...chat,
+                document: doc,
+                messages: messages,
+            },
+            message: "Chat Created successfully"
+        });
     } catch (error) {
         console.log("Error in uploadDocument:", error);
         return c.json({ error: "Upload failed" }, 500);
