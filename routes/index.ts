@@ -10,7 +10,7 @@ import { clerkMiddleware } from '@hono/clerk-auth';
 import { logger } from 'hono/logger';
 import { cors } from 'hono/cors';
 import { authorization } from '../middleware/auth';
-import { queryOnDocument, uploadDocument } from './chat';
+import { queryOnDocument, createChat, getAllChats } from './chat';
 
 const app = new Hono();
 
@@ -24,7 +24,8 @@ app.use('*', cors());
 
 app.get('/api/status', getApiStatus);
 app.post('/api/user/sync', authorization, syncUser);
-app.post('/api/document/upload', uploadDocument);
+app.post('/api/chat/create', authorization, createChat);
+app.get('/api/chat/all', authorization, getAllChats);
 app.post('/api/document/query', queryOnDocument);
 
 // API wildcard fallback (must come last)

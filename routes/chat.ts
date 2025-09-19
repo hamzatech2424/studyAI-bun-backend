@@ -1,5 +1,5 @@
 import { successResponseHelper, errorResponseHelper } from '../utils/response';
-import { documentsTable, docChunksTable, chatsTable, chatMessagesTable } from '../modals/schema';
+import { documentsTable, docChunksTable, usersTable, chatsTable, chatMessagesTable } from '../modals/schema';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { eq, asc } from 'drizzle-orm';
 import postgres from 'postgres';
@@ -22,11 +22,39 @@ if (!connectionString) {
 const client = postgres(connectionString, { prepare: false });
 const db = drizzle(client);
 
-const uploadDocument = async (c: any) => {
+const createChat = async (c: any) => {
     try {
+
+        const clerkUser = c.get('clerkUser');
+        if (!clerkUser) {
+            return c.json({
+                success: false,
+                error: {
+                    code: 401,
+                    message: "Unauthorized",
+                    description: "Authentication required"
+                }
+            }, 401);
+        }
+
+        // Find user in database using clerk ID
+        const user = await db.select().from(usersTable)
+            .where(eq(usersTable.clerk_id, clerkUser.userId));
+
+        if (!user || user.length === 0) {
+            return c.json({
+                success: false,
+                error: {
+                    code: 404,
+                    message: "User not found",
+                    description: "User does not exist in database"
+                }
+            }, 404);
+        }
+
         const form = await c.req.formData();
         const file = form.get("file") as File;
-        const userId = form.get("userId") as string | null;
+        const userId = user[0]?.id ?? null;
 
         if (!file) {
             return c.json({ error: "No file uploaded" }, 400);
@@ -176,8 +204,6 @@ const uploadDocument = async (c: any) => {
 };
 
 
-
-
 const queryOnDocument = async (c: any) => {
     try {
         const { documentId, question, k = 5 } = await c.req.json();
@@ -241,4 +267,29 @@ const queryOnDocument = async (c: any) => {
     }
 }
 
-export { uploadDocument, queryOnDocument };
+const getAllChats = async (c: any) => {
+    try {
+        const clerkUser = c.get('clerkUser');
+        if (!clerkUser) {
+            return c.json({ success: false, error: "Unauthorized" }, 401);
+        }
+
+        const user = await db.select().from(usersTable)
+            .where(eq(usersTable.clerk_id, clerkUser.userId));
+
+        if (!user || user.length === 0) {
+            return c.json({ success: false, error: "User not found" }, 404);
+        }
+
+        const chats = await db.select().from(chatsTable)
+            .where(eq(chatsTable.userId, user[0]?.id ?? null));
+
+        return successResponseHelper(c, { chats });
+    }
+    catch (error) {
+        console.log("Error in getAllChats:", error);
+        return errorResponseHelper(c, error);
+    }
+}
+
+export { createChat, queryOnDocument, getAllChats };
