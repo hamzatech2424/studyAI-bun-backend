@@ -374,33 +374,28 @@ const getSingleChat = async (c: any) => {
 
 
 const uploadDocumentWithProgress = async (c: any) => {
-    // Shared state so start() and cancel() can both see it
     let isClosed = false;
     let isError = false;
     let hasFinalEvent = false;
     let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
   
-    // Optional: abort controller to cancel long-running tasks (best-effort)
     const abortCtrl = new AbortController();
-  
     const encoder = new TextEncoder();
+  
+    // configurable grace window (e.g. 25s)
+    const GRACE_TIMEOUT = 25000;
+    let cancelTimer: NodeJS.Timeout | null = null;
   
     const stream = new ReadableStream({
       async start(controller) {
         controllerRef = controller;
   
-        // Safe enqueue: check flags first, wrap enqueue in try/catch to swallow race errors
         const safeEnqueue = (data: string) => {
-          if (isClosed || isError || hasFinalEvent) {
-            console.log("⚠️ Skipping enqueue: stream already closed/error/final");
-            return false;
-          }
+          if (isClosed || isError || hasFinalEvent) return false;
           try {
             controller.enqueue(encoder.encode(data));
             return true;
-          } catch (err) {
-            // This can happen when controller.close() wins the race — swallow it
-            console.log("⚠️ Ignoring enqueue after close (race).");
+          } catch {
             isClosed = true;
             return false;
           }
@@ -410,47 +405,41 @@ const uploadDocumentWithProgress = async (c: any) => {
           if (isClosed) return;
           try {
             controller.close();
-            isClosed = true;
-            console.log("✅ Stream closed");
-          } catch (err) {
-            console.log("⚠️ controller.close() threw (probably already closed)");
-            isClosed = true;
-          }
+          } catch {}
+          isClosed = true;
+          console.log("✅ Stream closed");
         };
   
         const sendFinal = (payload: any) => {
           if (hasFinalEvent) return;
           hasFinalEvent = true;
-          // Attempt to enqueue final payload (if fails we still mark closed)
-          const ok = safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
-          // close in any case to mark completion
+          safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
           closeStreamOnce();
-          return ok;
         };
   
-        const handleError = (error: any, message: string) => {
-          console.error("❌", message, error);
+        const handleError = (err: any, msg: string) => {
           if (isError || hasFinalEvent) return;
           isError = true;
           sendFinal({
             success: false,
-            error: message,
-            details: error instanceof Error ? error.message : String(error),
+            error: msg,
+            details: err instanceof Error ? err.message : String(err),
           });
         };
   
         const sendProgress = (message: string, progress?: number) =>
           `data: ${JSON.stringify({ message, progress })}\n\n`;
   
+        // 🔥 Heartbeat to keep weak clients alive
+        const heartbeat = setInterval(() => {
+          safeEnqueue(":ping\n\n"); // comment-event (SSE ping)
+        }, 15000); // every 15s
+  
         try {
-          // 1) Received file
           safeEnqueue(sendProgress("File received, starting upload...", 10));
   
           const form = await c.req.formData();
           const file = form.get("file") as File;
-  
-          // If client disconnected while waiting for form, abort
-          if (isClosed) return;
   
           const clerkUser = c.get("clerkUser");
           if (!clerkUser) return handleError(new Error("No user"), "Unauthorized");
@@ -463,140 +452,71 @@ const uploadDocumentWithProgress = async (c: any) => {
           if (!user?.length) return handleError(new Error("User missing"), "User not found");
           if (!file) return handleError(new Error("Missing file"), "No file uploaded");
   
-          // 2) Upload to Supabase
+          // 📤 Upload
           safeEnqueue(sendProgress("Uploading file to storage...", 30));
           const buf = Buffer.from(await file.arrayBuffer());
-  
-          if (isClosed) return; // stop if client disconnected
-  
           let fileUrl: string;
           try {
-            // Pass abort signal to fileUpload if it supports it (best-effort)
             fileUrl = await fileUpload(file, buf, { signal: abortCtrl.signal } as any);
             safeEnqueue(sendProgress("File uploaded successfully", 50));
           } catch (err) {
             return handleError(err, "Upload failed");
           }
   
-          if (isClosed) return;
-  
-          // 3) Parse PDF
+          // 📄 Parse PDF
           safeEnqueue(sendProgress("Parsing PDF content...", 60));
-          let parsed;
-          try {
-            // parse PDF; pass signal if your parser supports abort
-            parsed = await pdfParse(buf /*, { signal: abortCtrl.signal } */);
-          } catch (err) {
-            return handleError(err, "PDF parsing failed");
-          }
-  
-          if (isClosed) return;
-  
+          const parsed = await pdfParse(buf);
           const text = cleanText(parsed?.text || "");
           if (!text) return handleError(new Error("No text"), "PDF has no extractable text");
   
-          // 4) Create document record
+          // 📚 DB record
           safeEnqueue(sendProgress("Creating document record...", 70));
           const [doc] = await db
             .insert(documentsTable)
             .values({
-              userId: user[0]?.id ?? null,
+              userId: user[0].id,
               filePath: file.name,
               fileUrl,
               fileName: file.name,
             })
             .returning();
   
-          if (isClosed) return;
-  
-          // 5) Process chunks
+          // 🔀 Chunking
           safeEnqueue(sendProgress("Processing document chunks...", 80));
           const chunks = chunkText(text, 1200, 200);
   
-          if (isClosed) return;
-  
-          // 6) Create embeddings (stream progress per chunk)
+          // 🧠 Embeddings
           safeEnqueue(sendProgress("Creating AI embeddings...", 90));
-  
-          const batchSize = 5;
-          for (let i = 0; i < chunks.length; i += batchSize) {
-            // Check for cancellation before starting batch
-            if (isClosed || isError || hasFinalEvent) break;
-            const batch = chunks.slice(i, i + batchSize);
-  
-            for (let j = 0; j < batch.length; j++) {
-              const chunkIndex = i + j;
-              if (isClosed || isError || hasFinalEvent) break;
-  
-              try {
-                // If your OpenAI client supports abort signals, pass abortCtrl.signal
-                const resp = await openai.embeddings.create({
-                  model: "text-embedding-3-small",
-                  input: batch[j] || "",
-                  // signal: abortCtrl.signal, // uncomment if supported by your SDK
-                });
-  
-                // after response, check client still connected
-                if (isClosed) break;
-  
-                await db.insert(docChunksTable).values({
-                  documentId: doc.id,
-                  chunkIndex,
-                  text: batch[j],
-                  metadata: { source: file.name },
-                  embedding: resp.data[0]?.embedding,
-                });
-  
-                // compute fine-grained progress e.g. 90 → 98
-                const chunkProgress = 90 + Math.round(((chunkIndex + 1) / chunks.length) * 8);
-                // If enqueue fails (race), safeEnqueue returns false — but do not throw
-                safeEnqueue(sendProgress(`Embedding chunk ${chunkIndex + 1}/${chunks.length}`, chunkProgress));
-              } catch (err) {
-                console.error("Embedding error for chunk", chunkIndex, err);
-                // if aborted or closed, break; otherwise continue to next chunk
-                if (isClosed) break;
-              }
+          for (let i = 0; i < chunks.length; i++) {
+            if (isClosed) break;
+            try {
+              const resp = await openai.embeddings.create({
+                model: "text-embedding-3-small",
+                input: chunks[i],
+              });
+              await db.insert(docChunksTable).values({
+                documentId: doc.id,
+                chunkIndex: i,
+                text: chunks[i],
+                metadata: { source: file.name },
+                embedding: resp.data[0].embedding,
+              });
+              safeEnqueue(sendProgress(`Embedded ${i + 1}/${chunks.length}`, 90 + Math.round((i / chunks.length) * 8)));
+            } catch (err) {
+              console.error("Embedding error", i, err);
             }
-  
-            // small pause to yield & avoid hammering
-            if (isClosed || isError || hasFinalEvent) break;
-            await new Promise((r) => setTimeout(r, 50));
-          }
-  
-          if (isClosed) {
-            // client disconnected — abort any external requests if possible
-            try { abortCtrl.abort(); } catch (e) { /* ignore */ }
-            return;
-          }
-  
-          // 7) Create chat
-          safeEnqueue(sendProgress("Creating chat session...", 95));
-  
-          let chatTitle = file.name;
-          try {
-            const titleResp = await openai.chat.completions.create({
-              model: "gpt-3.5-turbo",
-              messages: [
-                { role: "system", content: "Generate a short, descriptive title (max 5 words) for this document." },
-                { role: "user", content: chunks[0] || file.name },
-              ],
-              temperature: 0.3,
-              max_tokens: 20,
-              // signal: abortCtrl.signal // uncomment if supported
-            });
-            chatTitle = titleResp.choices?.[0]?.message?.content || file.name;
-          } catch (err) {
-            console.error("Chat title generation failed:", err);
           }
   
           if (isClosed) return;
   
+          // 💬 Chat session
+          safeEnqueue(sendProgress("Creating chat session...", 95));
           const [chat] = await db
             .insert(chatsTable)
             .values({
-              userId: user[0]?.id ?? null,
-              documentId: doc?.id ?? null,
-              title: chatTitle,
+              userId: user[0].id,
+              documentId: doc.id,
+              title: file.name,
             })
             .returning();
   
@@ -614,34 +534,39 @@ const uploadDocumentWithProgress = async (c: any) => {
             .set({
               lastMessage: aiMessage.content,
               lastMessageType: aiMessage.type,
-              lastMessageAt: aiMessage.createdAt || new Date(),
+              lastMessageAt: aiMessage.createdAt,
             })
             .where(eq(chatsTable.id, chat.id));
   
-          // 8) Send final success payload and close
           sendFinal({
             success: true,
             message: "Upload complete!",
-            chat: {
-              ...chat,
-              document: doc,
-              messages: aiMessage,
-            },
+            chat: { ...chat, document: doc, messages: aiMessage },
           });
         } catch (err) {
           handleError(err, "Unexpected error during upload");
         } finally {
-          // Best-effort: abort any outstanding requests if client disconnected or error
+          clearInterval(heartbeat);
           if (isClosed || isError) {
-            try { abortCtrl.abort(); } catch (e) {}
+            try {
+              abortCtrl.abort();
+            } catch {}
           }
         }
       },
   
       cancel() {
-        console.log("⚠️ Client disconnected (cancel). Marking closed and aborting tasks");
-        isClosed = true;
-        try { abortCtrl.abort(); } catch (e) {}
+        console.log("⚠️ Cancel received. Waiting grace period...");
+        if (cancelTimer) clearTimeout(cancelTimer);
+  
+        // don’t close immediately — give slow clients time
+        cancelTimer = setTimeout(() => {
+          console.log("⏱ Grace expired, closing stream.");
+          isClosed = true;
+          try {
+            abortCtrl.abort();
+          } catch {}
+        }, GRACE_TIMEOUT);
       },
     });
   
