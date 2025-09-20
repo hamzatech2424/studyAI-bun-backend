@@ -409,12 +409,18 @@ const uploadDocumentWithProgress = async (c: any) => {
         const sendFinal = (payload: any) => {
           if (hasFinalEvent) return;
           hasFinalEvent = true;
-          safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
-          closeStream();
+          if (safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`)) {
+            // only close if enqueue succeeded
+            closeStream();
+          } else {
+            // if enqueue failed, still mark closed
+            closeStream();
+          }
         };
   
         const handleError = (error: any, message: string) => {
           console.error("❌", message, error);
+          if (isError || hasFinalEvent) return; // don't double fire
           isError = true;
           sendFinal({
             success: false,
@@ -424,8 +430,7 @@ const uploadDocumentWithProgress = async (c: any) => {
         };
   
         const sendProgress = (message: string, progress?: number) => {
-          const data = { message, progress };
-          return `data: ${JSON.stringify(data)}\n\n`;
+          return `data: ${JSON.stringify({ message, progress })}\n\n`;
         };
   
         try {
@@ -443,8 +448,10 @@ const uploadDocumentWithProgress = async (c: any) => {
             .from(usersTable)
             .where(eq(usersTable.clerk_id, clerkUser.userId));
   
-          if (!user?.length) return handleError(new Error("User missing"), "User not found");
-          if (!file) return handleError(new Error("Missing file"), "No file uploaded");
+          if (!user?.length)
+            return handleError(new Error("User missing"), "User not found");
+          if (!file)
+            return handleError(new Error("Missing file"), "No file uploaded");
   
           // 2. Upload to Supabase
           safeEnqueue(sendProgress("Uploading file to storage...", 30));
@@ -462,7 +469,8 @@ const uploadDocumentWithProgress = async (c: any) => {
           safeEnqueue(sendProgress("Parsing PDF content...", 60));
           const parsed = await pdfParse(buf);
           const text = cleanText(parsed.text || "");
-          if (!text) return handleError(new Error("No text"), "PDF has no extractable text");
+          if (!text)
+            return handleError(new Error("No text"), "PDF has no extractable text");
   
           // 4. Create document record
           safeEnqueue(sendProgress("Creating document record...", 70));
@@ -517,10 +525,9 @@ const uploadDocumentWithProgress = async (c: any) => {
                 );
               } catch (err) {
                 console.error("Embedding error for chunk", chunkIndex, err);
-                // continue with other chunks
               }
             }
-            await new Promise((r) => setTimeout(r, 100));
+            await new Promise((r) => setTimeout(r, 50));
           }
   
           // 7. Create chat
@@ -587,6 +594,11 @@ const uploadDocumentWithProgress = async (c: any) => {
           handleError(err, "Unexpected error during upload");
         }
       },
+  
+      cancel() {
+        console.log("⚠️ Client disconnected, closing stream");
+        isClosed = true;
+      },
     });
   
     return new Response(stream, {
@@ -598,6 +610,6 @@ const uploadDocumentWithProgress = async (c: any) => {
         "X-Accel-Buffering": "no",
       },
     });
-  };
+  }
 
 export { createChat, sendChatMessage, getAllChats, getSingleChat, uploadDocumentWithProgress };
