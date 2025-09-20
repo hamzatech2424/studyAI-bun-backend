@@ -381,19 +381,26 @@ const uploadDocumentWithProgress = async (c: any) => {
             let streamState = {
                 isClosed: false,
                 isError: false,
-                progress: 0
+                progress: 0,
+                isProcessing: false
             };
             
             // Enhanced safe enqueue with better error handling
             const safeEnqueue = (data: string) => {
-                // Check if controller is already closed
+                // Check if controller is already closed or in error state
                 if (streamState.isClosed || streamState.isError) {
                     console.log('⚠️ Stream already closed or in error state, skipping enqueue');
                     return false;
                 }
                 
                 try {
-                    // Simply try to enqueue - let the try/catch handle any errors
+                    // Check if controller is still writable
+                    if (controller.desiredSize === null) {
+                        console.log('⚠️ Controller is closed (desiredSize is null), marking as closed');
+                        streamState.isClosed = true;
+                        return false;
+                    }
+                    
                     controller.enqueue(new TextEncoder().encode(data));
                     console.log(`📤 Successfully enqueued: ${data.substring(0, 100)}...`);
                     return true;
@@ -452,20 +459,10 @@ const uploadDocumentWithProgress = async (c: any) => {
                 }
             }, 300000); // 5 minutes timeout
 
-            // Set up a heartbeat to keep the stream alive
-            const heartbeatId = setInterval(() => {
-                if (!streamState.isClosed && !streamState.isError) {
-                    safeEnqueue(`data: ${JSON.stringify({ type: 'heartbeat', timestamp: Date.now() })}\n\n`);
-                } else {
-                    clearInterval(heartbeatId);
-                }
-            }, 5000); // Send heartbeat every 5 seconds
-
             try {
                 // Progress 1: File received
                 if (!safeEnqueue(sendProgress("File received, starting upload...", 10))) {
                     clearTimeout(timeoutId);
-                    clearInterval(heartbeatId);
                     return;
                 }
 
@@ -476,6 +473,7 @@ const uploadDocumentWithProgress = async (c: any) => {
                 const clerkUser = c.get('clerkUser');
                 if (!clerkUser) {
                     handleError(new Error("No user context"), "Unauthorized");
+                    clearTimeout(timeoutId);
                     return;
                 }
 
@@ -484,16 +482,19 @@ const uploadDocumentWithProgress = async (c: any) => {
 
                 if (!user || user.length === 0) {
                     handleError(new Error("User not found in database"), "User not found");
+                    clearTimeout(timeoutId);
                     return;
                 }
 
                 if (!file) {
                     handleError(new Error("No file provided"), "No file uploaded");
+                    clearTimeout(timeoutId);
                     return;
                 }
 
                 // Progress 2: Uploading to Supabase
                 if (!safeEnqueue(sendProgress("Uploading file to storage...", 30))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -504,15 +505,18 @@ const uploadDocumentWithProgress = async (c: any) => {
                     fileUrl = await fileUpload(file, buf);
                     streamState.progress = 50;
                     if (!safeEnqueue(sendProgress("File uploaded successfully", streamState.progress))) {
+                        clearTimeout(timeoutId);
                         return;
                     }
                 } catch (uploadError) {
                     handleError(uploadError, "Upload failed");
+                    clearTimeout(timeoutId);
                     return;
                 }
 
                 // Progress 3: Parsing PDF
                 if (!safeEnqueue(sendProgress("Parsing PDF content...", 60))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -521,11 +525,13 @@ const uploadDocumentWithProgress = async (c: any) => {
 
                 if (!text) {
                     handleError(new Error("No text content"), "Error: PDF contains no extractable text");
+                    clearTimeout(timeoutId);
                     return;
                 }
 
                 // Progress 4: Creating document record
                 if (!safeEnqueue(sendProgress("Creating document record...", 70))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -538,6 +544,7 @@ const uploadDocumentWithProgress = async (c: any) => {
 
                 // Progress 5: Processing chunks
                 if (!safeEnqueue(sendProgress("Processing document chunks...", 80))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -545,46 +552,60 @@ const uploadDocumentWithProgress = async (c: any) => {
 
                 // Progress 6: Creating embeddings
                 if (!safeEnqueue(sendProgress("Creating AI embeddings...", 90))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
-                for (let i = 0; i < chunks.length; i++) {
-                    // Check stream state before each chunk
+                // Process chunks in batches to avoid overwhelming the stream
+                const batchSize = 5;
+                for (let i = 0; i < chunks.length; i += batchSize) {
+                    // Check stream state before each batch
                     if (streamState.isClosed || streamState.isError) {
                         console.log('⚠️ Stream closed during chunk processing, stopping');
+                        clearTimeout(timeoutId);
                         return;
                     }
                     
-                    const chunk = chunks[i];
+                    const batch = chunks.slice(i, i + batchSize);
                     
-                    try {
-                        const resp = await openai.embeddings.create({
-                            model: "text-embedding-3-small",
-                            input: chunk || "",
-                        });
+                    for (let j = 0; j < batch.length; j++) {
+                        const chunk = batch[j];
+                        const chunkIndex = i + j;
+                        
+                        try {
+                            const resp = await openai.embeddings.create({
+                                model: "text-embedding-3-small",
+                                input: chunk || "",
+                            });
 
-                        const embedding = resp.data[0]?.embedding;
-                        await db.insert(docChunksTable).values({
-                            documentId: doc?.id,
-                            chunkIndex: i,
-                            text: chunk,
-                            metadata: { source: file.name },
-                            embedding,
-                        });
+                            const embedding = resp.data[0]?.embedding;
+                            await db.insert(docChunksTable).values({
+                                documentId: doc?.id,
+                                chunkIndex: chunkIndex,
+                                text: chunk,
+                                metadata: { source: file.name },
+                                embedding,
+                            });
 
-                        // Update progress for each chunk
-                        const chunkProgress = 90 + Math.round(((i + 1) / chunks.length) * 8);
-                        if (!safeEnqueue(sendProgress(`Embedding chunk ${i + 1}/${chunks.length}`, chunkProgress))) {
-                            return;
+                            // Update progress for each chunk
+                            const chunkProgress = 90 + Math.round(((chunkIndex + 1) / chunks.length) * 8);
+                            if (!safeEnqueue(sendProgress(`Embedding chunk ${chunkIndex + 1}/${chunks.length}`, chunkProgress))) {
+                                clearTimeout(timeoutId);
+                                return;
+                            }
+                        } catch (err) {
+                            console.error("Embedding error for chunk", chunkIndex, err);
+                            // Continue with other chunks even if one fails
                         }
-                    } catch (err) {
-                        console.error("Embedding error for chunk", i, err);
-                        // Continue with other chunks even if one fails
                     }
+                    
+                    // Small delay between batches to prevent overwhelming
+                    await new Promise(resolve => setTimeout(resolve, 100));
                 }
 
                 // Progress 7: Creating chat
                 if (!safeEnqueue(sendProgress("Creating chat session...", 95))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -632,6 +653,7 @@ const uploadDocumentWithProgress = async (c: any) => {
 
                 // Progress 8: Complete
                 if (!safeEnqueue(sendProgress("Upload complete!", 100))) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
@@ -647,17 +669,16 @@ const uploadDocumentWithProgress = async (c: any) => {
                 };
                 
                 if (!safeEnqueue(`data: ${JSON.stringify(result)}\n\n`)) {
+                    clearTimeout(timeoutId);
                     return;
                 }
                 
-                // Clear timeout and heartbeat, then final close
+                // Clear timeout and final close
                 clearTimeout(timeoutId);
-                clearInterval(heartbeatId);
                 safeClose();
 
             } catch (error) {
                 clearTimeout(timeoutId);
-                clearInterval(heartbeatId);
                 handleError(error, "Unexpected error during upload");
             }
         }
