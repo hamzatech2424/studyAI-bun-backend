@@ -373,148 +373,231 @@ const getSingleChat = async (c: any) => {
 }
 
 
-
 const uploadDocumentWithProgress = async (c: any) => {
     const stream = new ReadableStream({
-        async start(controller) {
-            let isClosed = false;
-            let isError = false;
-
-            const safeEnqueue = (data: string) => {
-                if (isClosed || isError) return false;
-                try {
-                    controller.enqueue(new TextEncoder().encode(data));
-                    return true;
-                } catch (err) {
-                    console.error("❌ Enqueue failed:", err);
-                    isClosed = true;
-                    return false;
-                }
-            };
-
-            const safeClose = () => {
-                if (!isClosed) {
-                    try {
-                        controller.close();
-                    } catch (err) {
-                        console.error("❌ Close failed:", err);
-                    }
-                    isClosed = true;
-                }
-            };
-
-            const handleError = (err: any, message: string) => {
-                console.error("❌", message, err);
-                isError = true;
-                safeEnqueue(`data: ${JSON.stringify({ success: false, error: message })}\n\n`);
-                safeClose();
-            };
-
-            const sendProgress = (msg: string, progress: number) =>
-                `data: ${JSON.stringify({ message: msg, progress })}\n\n`;
-
-            try {
-                const form = await c.req.formData();
-                const file = form.get("file") as File;
-
-                if (!file) {
-                    handleError(new Error("Missing file"), "No file uploaded");
-                    return;
-                }
-
-                // ✅ Progress updates
-                safeEnqueue(sendProgress("File received, starting upload...", 10));
-
-                // Upload
-                let fileUrl: string;
-                try {
-                    const buf = Buffer.from(await file.arrayBuffer());
-                    fileUrl = await fileUpload(file, buf);
-                    safeEnqueue(sendProgress("File uploaded", 50));
-
-                    // Parse PDF
-                    const parsed = await pdfParse(buf);
-                    const text = cleanText(parsed.text || "");
-                    if (!text) {
-                        handleError(new Error("Empty PDF"), "No extractable text");
-                        return;
-                    }
-
-                    safeEnqueue(sendProgress("Processing document...", 70));
-
-                    // Save doc
-                    const [doc] = await db.insert(documentsTable).values({
-                        userId: c.get("clerkUser")?.id,
-                        fileUrl,
-                        fileName: file.name,
-                    }).returning();
-
-                    // Chunk
-                    const chunks = chunkText(text, 1200, 200);
-                    safeEnqueue(sendProgress("Creating embeddings...", 80));
-
-                    for (let i = 0; i < chunks.length; i++) {
-                        if (isClosed || isError) break; // 🚀 stop immediately if closed
-
-                        try {
-                            const resp = await openai.embeddings.create({
-                                model: "text-embedding-3-small",
-                                input: chunks[i],
-                            });
-                            await db.insert(docChunksTable).values({
-                                documentId: doc.id,
-                                chunkIndex: i,
-                                text: chunks[i],
-                                embedding: resp.data[0].embedding,
-                            });
-                        } catch (err) {
-                            console.error("Embedding error:", err);
-                        }
-
-                        const pct = 80 + Math.round(((i + 1) / chunks.length) * 15);
-                        safeEnqueue(sendProgress(`Embedded ${i + 1}/${chunks.length}`, pct));
-                    }
-
-                    if (isClosed || isError) return; // 🚀 don’t continue if closed
-
-                    // Finalize chat
-                    const [chat] = await db.insert(chatsTable).values({
-                        userId: c.get("clerkUser")?.id,
-                        documentId: doc.id,
-                        title: file.name,
-                    }).returning();
-
-                    const [msg] = await db.insert(chatMessagesTable).values({
-                        chatId: chat.id,
-                        type: "ai",
-                        content: "How can I assist you?",
-                    }).returning();
-
-                    safeEnqueue(sendProgress("Upload complete!", 100));
-
-                    // Final payload
-                    safeEnqueue(`data: ${JSON.stringify({ success: true, chat, message: msg })}\n\n`);
-                } catch (err) {
-                    handleError(err, "Upload failed");
-                }
-
-                safeClose(); // ✅ close once at the end
-            } catch (err) {
-                handleError(err, "Unexpected error");
-                safeClose();
+      async start(controller) {
+        let isClosed = false;
+        let isError = false;
+        let hasFinalEvent = false;
+  
+        const safeEnqueue = (data: string) => {
+          if (isClosed || isError || hasFinalEvent) {
+            console.log("⚠️ Skipping enqueue: stream already closed/error/final");
+            return false;
+          }
+          try {
+            controller.enqueue(new TextEncoder().encode(data));
+            return true;
+          } catch (err) {
+            console.error("❌ Enqueue failed:", err);
+            isClosed = true;
+            return false;
+          }
+        };
+  
+        const closeStream = () => {
+          if (isClosed) return;
+          try {
+            controller.close();
+            isClosed = true;
+            console.log("✅ Stream closed");
+          } catch (err) {
+            console.error("❌ Close failed:", err);
+          }
+        };
+  
+        const sendFinal = (payload: any) => {
+          if (hasFinalEvent) return;
+          hasFinalEvent = true;
+          safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
+          closeStream();
+        };
+  
+        const handleError = (error: any, message: string) => {
+          console.error("❌", message, error);
+          isError = true;
+          sendFinal({
+            success: false,
+            error: message,
+            details: error instanceof Error ? error.message : "Unknown error",
+          });
+        };
+  
+        const sendProgress = (message: string, progress?: number) => {
+          const data = { message, progress };
+          return `data: ${JSON.stringify(data)}\n\n`;
+        };
+  
+        try {
+          // 1. File received
+          safeEnqueue(sendProgress("File received, starting upload...", 10));
+  
+          const form = await c.req.formData();
+          const file = form.get("file") as File;
+  
+          const clerkUser = c.get("clerkUser");
+          if (!clerkUser) return handleError(new Error("No user"), "Unauthorized");
+  
+          const user = await db
+            .select()
+            .from(usersTable)
+            .where(eq(usersTable.clerk_id, clerkUser.userId));
+  
+          if (!user?.length) return handleError(new Error("User missing"), "User not found");
+          if (!file) return handleError(new Error("Missing file"), "No file uploaded");
+  
+          // 2. Upload to Supabase
+          safeEnqueue(sendProgress("Uploading file to storage...", 30));
+  
+          const buf = Buffer.from(await file.arrayBuffer());
+          let fileUrl: string;
+          try {
+            fileUrl = await fileUpload(file, buf);
+            safeEnqueue(sendProgress("File uploaded successfully", 50));
+          } catch (err) {
+            return handleError(err, "Upload failed");
+          }
+  
+          // 3. Parse PDF
+          safeEnqueue(sendProgress("Parsing PDF content...", 60));
+          const parsed = await pdfParse(buf);
+          const text = cleanText(parsed.text || "");
+          if (!text) return handleError(new Error("No text"), "PDF has no extractable text");
+  
+          // 4. Create document record
+          safeEnqueue(sendProgress("Creating document record...", 70));
+          const [doc] = await db
+            .insert(documentsTable)
+            .values({
+              userId: user[0]?.id ?? null,
+              filePath: file.name,
+              fileUrl,
+              fileName: file.name,
+            })
+            .returning();
+  
+          // 5. Process chunks
+          safeEnqueue(sendProgress("Processing document chunks...", 80));
+          const chunks = chunkText(text, 1200, 200);
+  
+          // 6. Create embeddings
+          safeEnqueue(sendProgress("Creating AI embeddings...", 90));
+  
+          const batchSize = 5;
+          for (let i = 0; i < chunks.length; i += batchSize) {
+            if (isClosed || isError || hasFinalEvent) break;
+  
+            const batch = chunks.slice(i, i + batchSize);
+  
+            for (let j = 0; j < batch.length; j++) {
+              const chunkIndex = i + j;
+              if (isClosed || isError || hasFinalEvent) break;
+  
+              try {
+                const resp = await openai.embeddings.create({
+                  model: "text-embedding-3-small",
+                  input: batch[j] || "",
+                });
+  
+                await db.insert(docChunksTable).values({
+                  documentId: doc.id,
+                  chunkIndex,
+                  text: batch[j],
+                  metadata: { source: file.name },
+                  embedding: resp.data[0]?.embedding,
+                });
+  
+                const chunkProgress =
+                  90 + Math.round(((chunkIndex + 1) / chunks.length) * 8);
+                safeEnqueue(
+                  sendProgress(
+                    `Embedding chunk ${chunkIndex + 1}/${chunks.length}`,
+                    chunkProgress
+                  )
+                );
+              } catch (err) {
+                console.error("Embedding error for chunk", chunkIndex, err);
+                // continue with other chunks
+              }
             }
-        },
+            await new Promise((r) => setTimeout(r, 100));
+          }
+  
+          // 7. Create chat
+          safeEnqueue(sendProgress("Creating chat session...", 95));
+  
+          let chatTitle = file.name;
+          try {
+            const titleResp = await openai.chat.completions.create({
+              model: "gpt-3.5-turbo",
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "Generate a short, descriptive title (max 5 words) for this document.",
+                },
+                { role: "user", content: chunks[0] || file.name },
+              ],
+              temperature: 0.3,
+              max_tokens: 20,
+            });
+            chatTitle = titleResp.choices[0]?.message?.content || file.name;
+          } catch (err) {
+            console.error("Chat title generation failed:", err);
+          }
+  
+          const [chat] = await db
+            .insert(chatsTable)
+            .values({
+              userId: user[0]?.id ?? null,
+              documentId: doc?.id ?? null,
+              title: chatTitle,
+            })
+            .returning();
+  
+          const [aiMessage] = await db
+            .insert(chatMessagesTable)
+            .values({
+              chatId: chat.id,
+              type: "ai",
+              content: "How can I assist you?",
+            })
+            .returning();
+  
+          await db
+            .update(chatsTable)
+            .set({
+              lastMessage: aiMessage.content,
+              lastMessageType: aiMessage.type,
+              lastMessageAt: aiMessage.createdAt || new Date(),
+            })
+            .where(eq(chatsTable.id, chat.id));
+  
+          // 8. Complete
+          sendFinal({
+            success: true,
+            message: "Upload complete!",
+            chat: {
+              ...chat,
+              document: doc,
+              messages: aiMessage,
+            },
+          });
+        } catch (err) {
+          handleError(err, "Unexpected error during upload");
+        }
+      },
     });
-
+  
     return new Response(stream, {
-        headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "X-Accel-Buffering": "no",
-        },
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+        "X-Accel-Buffering": "no",
+      },
     });
-};
+  };
 
 export { createChat, sendChatMessage, getAllChats, getSingleChat, uploadDocumentWithProgress };
