@@ -5,7 +5,8 @@ export const usersTable = pgTable("users", {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
   clerk_id: varchar("clerk_id", { length: 255 }).notNull(),
   email: varchar("email", { length: 255 }).notNull(),
-  full_name: varchar("full_name", { length: 255 }),
+  last_name: varchar("last_name", { length: 255 }),
+  first_name: varchar("first_name", { length: 255 }),
   raw: json("raw").$type<any>(), // whole clerk user object
   created_at: timestamp("created_at").defaultNow(),
 }, (table) => ({

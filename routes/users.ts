@@ -26,21 +26,24 @@ const syncUser = async (c: any) => {
         }
       }, 401);
     }
+
     // Check if user exists in database
     const existingUser = await db.select().from(usersTable)
       .where(eq(usersTable.clerk_id, clerkUser.userId));
-
     let user;
     if (existingUser.length > 0) {
       // Update existing user
       user = await db.update(usersTable)
         .set({
           email: clerkUser.userData.emailAddresses[0]?.emailAddress || '',
+          first_name: clerkUser.userData.firstName || '',
+          last_name: clerkUser.userData.lastName || '',
           raw: clerkUser.userData
         })
         .where(eq(usersTable.clerk_id, clerkUser.userId))
         .returning();
-      
+
+
     } else {
       // Create new user
       user = await db.insert(usersTable).values({
@@ -48,7 +51,7 @@ const syncUser = async (c: any) => {
         email: clerkUser.userData.emailAddresses[0]?.emailAddress || '',
         raw: clerkUser.userData
       }).returning();
-      
+
     }
 
     return successResponseHelper(c, {

@@ -10,7 +10,7 @@ import { clerkMiddleware } from '@hono/clerk-auth';
 import { logger } from 'hono/logger';
 import { cors } from 'hono/cors';
 import { authorization } from '../middleware/auth';
-import { queryOnDocument, createChat, getAllChats } from './chat';
+import { createChat, getAllChats, getSingleChat, sendChatMessage, uploadDocumentWithProgress, testSSE } from './chat';
 
 const app = new Hono();
 
@@ -22,11 +22,13 @@ app.use('/api/*', clerkMiddleware({
 app.use('*', logger());
 app.use('*', cors());
 
-app.get('/api/status', getApiStatus);
-app.post('/api/user/sync', authorization, syncUser);
-app.post('/api/chat/create', authorization, createChat);
+app.post('/api/user/sync', authorization, syncUser)
+app.post('/api/chat/create', authorization, createChat); //without progress updates
 app.get('/api/chat/all', authorization, getAllChats);
-app.post('/api/document/query', queryOnDocument);
+app.get('/api/chat/single/:chatId', authorization, getSingleChat);
+app.post('/api/chat/message/:chatId', authorization, sendChatMessage);
+
+app.post('/api/document/upload-stream', authorization, uploadDocumentWithProgress);
 
 // API wildcard fallback (must come last)
 app.get('/api/*', getApiNotFound);
