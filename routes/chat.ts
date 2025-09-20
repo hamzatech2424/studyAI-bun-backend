@@ -393,13 +393,7 @@ const uploadDocumentWithProgress = async (c: any) => {
                 }
                 
                 try {
-                    // Check controller state before attempting to enqueue
-                    if (controller.desiredSize === null) {
-                        console.log('⚠️ Controller is closed (desiredSize is null), skipping enqueue');
-                        streamState.isClosed = true;
-                        return false;
-                    }
-                    
+                    // Simply try to enqueue - let the try/catch handle any errors
                     controller.enqueue(new TextEncoder().encode(data));
                     console.log(`📤 Successfully enqueued: ${data.substring(0, 100)}...`);
                     return true;
