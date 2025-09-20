@@ -31,6 +31,7 @@ const syncUser = async (c: any) => {
     const existingUser = await db.select().from(usersTable)
       .where(eq(usersTable.clerk_id, clerkUser.userId));
     let user;
+    
     if (existingUser.length > 0) {
       // Update existing user
       user = await db.update(usersTable)
@@ -42,16 +43,15 @@ const syncUser = async (c: any) => {
         })
         .where(eq(usersTable.clerk_id, clerkUser.userId))
         .returning();
-
-
     } else {
       // Create new user
       user = await db.insert(usersTable).values({
         clerk_id: clerkUser.userId,
         email: clerkUser.userData.emailAddresses[0]?.emailAddress || '',
+        first_name: clerkUser.userData.firstName || '',
+        last_name: clerkUser.userData.lastName || '',
         raw: clerkUser.userData
       }).returning();
-
     }
 
     return successResponseHelper(c, {
@@ -67,8 +67,5 @@ const syncUser = async (c: any) => {
     return errorResponseHelper(c, error);
   }
 };
-
-
-
 
 export { syncUser };
