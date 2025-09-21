@@ -434,8 +434,32 @@ const uploadDocumentWithProgress = async (c: any) => {
             const sendFinal = (payload: any) => {
                 if (hasFinalEvent) return;
                 hasFinalEvent = true;
-                safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
-                closeStreamOnce();
+                
+                try {
+                    const finalData = `data: ${JSON.stringify(payload)}\n\n`;
+                    
+                    // Try to send the final data
+                    if (isClosed || isError) {
+                        console.log("⚠️ Stream already closed, cannot send final data");
+                        return;
+                    }
+                    
+                    try {
+                        controllerRef?.enqueue(encoder.encode(finalData));
+                        console.log("�� Final success data sent successfully");
+                        
+                        // Close the stream after successful send
+                        setTimeout(() => {
+                            closeStreamOnce();
+                        }, 50);
+                    } catch (err) {
+                        console.log("⚠️ Failed to enqueue final data:", err);
+                        isClosed = true;
+                    }
+                } catch (error) {
+                    console.error("❌ Error in sendFinal:", error);
+                    isClosed = true;
+                }
             };
 
             const handleError = async (err: any, msg: string) => {
