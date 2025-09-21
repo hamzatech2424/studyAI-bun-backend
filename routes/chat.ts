@@ -85,36 +85,36 @@ const createChat = async (c: any) => {
 
         // insert document metadata
         const [doc] = await db
-          .insert(documentsTable)
-          .values({
-            userId: userId ?? null,
-            filePath: file.name,
+            .insert(documentsTable)
+            .values({
+                userId: userId ?? null,
+                filePath: file.name,
                 fileUrl: fileUrl as string,
-            fileName: file.name,
-          })
-          .returning();
-      
+                fileName: file.name,
+            })
+            .returning();
+
         // split into chunks
         const chunks = chunkText(text, 1200, 200);
-     
+
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
 
             try {
                 // ✅ New embeddings call (2024 SDK)
                 const resp = await openai.embeddings.create({
-                model: "text-embedding-3-small",
+                    model: "text-embedding-3-small",
                     input: chunk || "",
-            });
+                });
 
                 const embedding = resp.data[0]?.embedding;
 
                 // insert chunk + vector
-            await db.insert(docChunksTable).values({
-                documentId: doc?.id,
-                chunkIndex: i,
-                text: chunk,
-                metadata: { source: file.name },
+                await db.insert(docChunksTable).values({
+                    documentId: doc?.id,
+                    chunkIndex: i,
+                    text: chunk,
+                    metadata: { source: file.name },
                     embedding, // Drizzle + pgvector handles this fine
                 });
             } catch (err) {
@@ -378,207 +378,240 @@ const uploadDocumentWithProgress = async (c: any) => {
     let isError = false;
     let hasFinalEvent = false;
     let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
-  
+
     const abortCtrl = new AbortController();
     const encoder = new TextEncoder();
-  
-    // configurable grace window (e.g. 25s)
+
+    // configurable grace window
     const GRACE_TIMEOUT = 25000;
     let cancelTimer: NodeJS.Timeout | null = null;
-  
-    const stream = new ReadableStream({
-      async start(controller) {
-        controllerRef = controller;
-  
-        const safeEnqueue = (data: string) => {
-          if (isClosed || isError || hasFinalEvent) return false;
-          try {
-            controller.enqueue(encoder.encode(data));
-            return true;
-          } catch {
-            isClosed = true;
-            return false;
-          }
-        };
-  
-        const closeStreamOnce = () => {
-          if (isClosed) return;
-          try {
-            controller.close();
-          } catch {}
-          isClosed = true;
-          console.log("✅ Stream closed");
-        };
-  
-        const sendFinal = (payload: any) => {
-          if (hasFinalEvent) return;
-          hasFinalEvent = true;
-          safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
-          closeStreamOnce();
-        };
-  
-        const handleError = (err: any, msg: string) => {
-          if (isError || hasFinalEvent) return;
-          isError = true;
-          sendFinal({
-            success: false,
-            error: msg,
-            details: err instanceof Error ? err.message : String(err),
-          });
-        };
-  
-        const sendProgress = (message: string, progress?: number) =>
-          `data: ${JSON.stringify({ message, progress })}\n\n`;
-  
-        // 🔥 Heartbeat to keep weak clients alive
-        const heartbeat = setInterval(() => {
-          safeEnqueue(":ping\n\n"); // comment-event (SSE ping)
-        }, 15000); // every 15s
-  
+
+    // Track created resources
+    let createdDocId: string | null = null;
+    let createdChatId: string | null = null;
+
+    // ✅ Define cleanup here so both start & cancel can use it
+    const cleanupDb = async () => {
         try {
-          safeEnqueue(sendProgress("File received, starting upload...", 10));
-  
-          const form = await c.req.formData();
-          const file = form.get("file") as File;
-  
-          const clerkUser = c.get("clerkUser");
-          if (!clerkUser) return handleError(new Error("No user"), "Unauthorized");
-  
-          const user = await db
-            .select()
-            .from(usersTable)
-            .where(eq(usersTable.clerk_id, clerkUser.userId));
-  
-          if (!user?.length) return handleError(new Error("User missing"), "User not found");
-          if (!file) return handleError(new Error("Missing file"), "No file uploaded");
-  
-          // 📤 Upload
-          safeEnqueue(sendProgress("Uploading file to storage...", 30));
-          const buf = Buffer.from(await file.arrayBuffer());
-          let fileUrl: string;
-          try {
-            fileUrl = await fileUpload(file, buf, { signal: abortCtrl.signal } as any);
-            safeEnqueue(sendProgress("File uploaded successfully", 50));
-          } catch (err) {
-            return handleError(err, "Upload failed");
-          }
-  
-          // 📄 Parse PDF
-          safeEnqueue(sendProgress("Parsing PDF content...", 60));
-          const parsed = await pdfParse(buf);
-          const text = cleanText(parsed?.text || "");
-          if (!text) return handleError(new Error("No text"), "PDF has no extractable text");
-  
-          // 📚 DB record
-          safeEnqueue(sendProgress("Creating document record...", 70));
-          const [doc] = await db
-            .insert(documentsTable)
-            .values({
-              userId: user[0].id,
-              filePath: file.name,
-              fileUrl,
-              fileName: file.name,
-            })
-            .returning();
-  
-          // 🔀 Chunking
-          safeEnqueue(sendProgress("Processing document chunks...", 80));
-          const chunks = chunkText(text, 1200, 200);
-  
-          // 🧠 Embeddings
-          safeEnqueue(sendProgress("Creating AI embeddings...", 90));
-          for (let i = 0; i < chunks.length; i++) {
-            if (isClosed) break;
-            try {
-              const resp = await openai.embeddings.create({
-                model: "text-embedding-3-small",
-                input: chunks[i],
-              });
-              await db.insert(docChunksTable).values({
-                documentId: doc.id,
-                chunkIndex: i,
-                text: chunks[i],
-                metadata: { source: file.name },
-                embedding: resp.data[0].embedding,
-              });
-              safeEnqueue(sendProgress(`Embedded ${i + 1}/${chunks.length}`, 90 + Math.round((i / chunks.length) * 8)));
-            } catch (err) {
-              console.error("Embedding error", i, err);
+            if (createdChatId) {
+                await db.delete(chatMessagesTable).where(eq(chatMessagesTable.chatId, createdChatId));
+                await db.delete(chatsTable).where(eq(chatsTable.id, createdChatId));
             }
-          }
-  
-          if (isClosed) return;
-  
-          // 💬 Chat session
-          safeEnqueue(sendProgress("Creating chat session...", 95));
-          const [chat] = await db
-            .insert(chatsTable)
-            .values({
-              userId: user[0].id,
-              documentId: doc.id,
-              title: file.name,
-            })
-            .returning();
-  
-          const [aiMessage] = await db
-            .insert(chatMessagesTable)
-            .values({
-              chatId: chat.id,
-              type: "ai",
-              content: "How can I assist you?",
-            })
-            .returning();
-  
-          await db
-            .update(chatsTable)
-            .set({
-              lastMessage: aiMessage.content,
-              lastMessageType: aiMessage.type,
-              lastMessageAt: aiMessage.createdAt,
-            })
-            .where(eq(chatsTable.id, chat.id));
-  
-          sendFinal({
-            success: true,
-            message: "Upload complete!",
-            chat: { ...chat, document: doc, messages: aiMessage },
-          });
+            if (createdDocId) {
+                await db.delete(docChunksTable).where(eq(docChunksTable.documentId, createdDocId));
+                await db.delete(documentsTable).where(eq(documentsTable.id, createdDocId));
+            }
+            console.log("🧹 Cleanup finished");
         } catch (err) {
-          handleError(err, "Unexpected error during upload");
-        } finally {
-          clearInterval(heartbeat);
-          if (isClosed || isError) {
-            try {
-              abortCtrl.abort();
-            } catch {}
-          }
+            console.error("❌ Cleanup error:", err);
         }
-      },
-  
-      cancel() {
-        console.log("⚠️ Cancel received. Waiting grace period...");
-        if (cancelTimer) clearTimeout(cancelTimer);
-  
-        // don’t close immediately — give slow clients time
-        cancelTimer = setTimeout(() => {
-          console.log("⏱ Grace expired, closing stream.");
-          isClosed = true;
-          try {
-            abortCtrl.abort();
-          } catch {}
-        }, GRACE_TIMEOUT);
-      },
+    };
+
+    const stream = new ReadableStream({
+        async start(controller) {
+            controllerRef = controller;
+
+            const safeEnqueue = (data: string) => {
+                if (isClosed || isError || hasFinalEvent) return false;
+                try {
+                    controller.enqueue(encoder.encode(data));
+                    return true;
+                } catch {
+                    isClosed = true;
+                    return false;
+                }
+            };
+
+            const closeStreamOnce = () => {
+                if (isClosed) return;
+                try {
+                    controller.close();
+                } catch { }
+                isClosed = true;
+                console.log("✅ Stream closed");
+            };
+
+            const sendFinal = (payload: any) => {
+                if (hasFinalEvent) return;
+                hasFinalEvent = true;
+                safeEnqueue(`data: ${JSON.stringify(payload)}\n\n`);
+                closeStreamOnce();
+            };
+
+            const handleError = async (err: any, msg: string) => {
+                if (isError || hasFinalEvent) return;
+                isError = true;
+
+                console.error("❌ Upload error:", err);
+
+                await cleanupDb();
+
+                sendFinal({
+                    success: false,
+                    error: msg,
+                    details: err instanceof Error ? err.message : String(err),
+                });
+            };
+
+            const sendProgress = (message: string, progress?: number) =>
+                `data: ${JSON.stringify({ message, progress })}\n\n`;
+
+            const heartbeat = setInterval(() => {
+                safeEnqueue(":ping\n\n"); // keep-alive
+            }, 15000);
+
+            try {
+                safeEnqueue(sendProgress("File received, starting upload...", 10));
+
+                const form = await c.req.formData();
+                const file = form.get("file") as File;
+
+                const clerkUser = c.get("clerkUser");
+                if (!clerkUser) return handleError(new Error("No user"), "Unauthorized");
+
+                const user = await db
+                    .select()
+                    .from(usersTable)
+                    .where(eq(usersTable.clerk_id, clerkUser.userId));
+
+                if (!user?.length) return handleError(new Error("User missing"), "User not found");
+                if (!file) return handleError(new Error("Missing file"), "No file uploaded");
+
+                // 📤 Upload file
+                safeEnqueue(sendProgress("Uploading file to storage...", 30));
+                const buf = Buffer.from(await file.arrayBuffer());
+                let fileUrl: string;
+                try {
+                    fileUrl = await fileUpload(file, buf, { signal: abortCtrl.signal } as any);
+                    safeEnqueue(sendProgress("File uploaded successfully", 50));
+                } catch (err) {
+                    return handleError(err, "Upload failed");
+                }
+
+                // 📄 Parse PDF
+                safeEnqueue(sendProgress("Parsing PDF content...", 60));
+                const parsed = await pdfParse(buf);
+                const text = cleanText(parsed?.text || "");
+                if (!text) return handleError(new Error("No text"), "PDF has no extractable text");
+
+                // ✅ Create document FIRST
+                safeEnqueue(sendProgress("Creating document record...", 70));
+                const [doc] = await db
+                    .insert(documentsTable)
+                    .values({
+                        userId: user[0].id,
+                        filePath: file.name,
+                        fileUrl,
+                        fileName: file.name,
+                    })
+                    .returning();
+
+                createdDocId = doc.id; // immediately track it
+
+                // 🔀 Chunk + embeddings
+                safeEnqueue(sendProgress("Processing document chunks...", 80));
+                const chunks = chunkText(text, 1200, 200);
+
+                safeEnqueue(sendProgress("Creating AI embeddings...", 90));
+                for (let i = 0; i < chunks.length; i++) {
+                    if (isClosed) break;
+                    try {
+                        const resp = await openai.embeddings.create({
+                            model: "text-embedding-3-small",
+                            input: chunks[i],
+                        });
+
+                        await db.insert(docChunksTable).values({
+                            documentId: createdDocId, // ✅ guaranteed to exist
+                            chunkIndex: i,
+                            text: chunks[i],
+                            metadata: { source: file.name },
+                            embedding: resp.data[0].embedding,
+                        });
+
+                        safeEnqueue(
+                            sendProgress(`Embedded ${i + 1}/${chunks.length}`, 90 + Math.round((i / chunks.length) * 8))
+                        );
+                    } catch (err) {
+                        console.error("Embedding error", i, err);
+                    }
+                }
+
+                if (isClosed) return;
+
+                // 💬 Chat session
+                safeEnqueue(sendProgress("Creating chat session...", 95));
+                const [chat] = await db
+                    .insert(chatsTable)
+                    .values({
+                        userId: user[0].id,
+                        documentId: createdDocId,
+                        title: file.name,
+                    })
+                    .returning();
+
+                createdChatId = chat.id;
+
+                const [aiMessage] = await db
+                    .insert(chatMessagesTable)
+                    .values({
+                        chatId: chat.id,
+                        type: "ai",
+                        content: "How can I assist you?",
+                    })
+                    .returning();
+
+                await db
+                    .update(chatsTable)
+                    .set({
+                        lastMessage: aiMessage.content,
+                        lastMessageType: aiMessage.type,
+                        lastMessageAt: aiMessage.createdAt,
+                    })
+                    .where(eq(chatsTable.id, chat.id));
+
+                sendFinal({
+                    success: true,
+                    message: "Upload complete!",
+                    chat: { ...chat, document: { id: createdDocId }, messages: aiMessage },
+                });
+            } catch (err) {
+                handleError(err, "Unexpected error during upload");
+            } finally {
+                clearInterval(heartbeat);
+                if (isClosed || isError) {
+                    try {
+                        abortCtrl.abort();
+                    } catch { }
+                }
+            }
+        },
+
+        async cancel() {
+            console.log("⚠️ Cancel received. Scheduling cleanup...");
+
+            if (cancelTimer) clearTimeout(cancelTimer);
+            cancelTimer = setTimeout(async () => {
+                isClosed = true;
+                try {
+                    await cleanupDb(); // ✅ Now works
+                    abortCtrl.abort();
+                } catch (err) {
+                    console.error("❌ Cancel cleanup failed:", err);
+                }
+            }, GRACE_TIMEOUT);
+        },
     });
-  
+
     return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "X-Accel-Buffering": "no",
-      },
+        headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            Connection: "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "X-Accel-Buffering": "no",
+        },
     });
-  };
+};
 
 export { createChat, sendChatMessage, getAllChats, getSingleChat, uploadDocumentWithProgress };
